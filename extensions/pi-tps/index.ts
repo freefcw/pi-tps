@@ -47,6 +47,10 @@ interface MessageStartEvent {
 interface MessageUpdateEvent {
   type: 'message_update';
   message: unknown;
+  assistantMessageEvent?: {
+    type?: string;
+    delta?: string;
+  };
 }
 
 interface MessageEndEvent {
@@ -77,6 +81,19 @@ const NEURALWATT_ENERGY_EVENT = 'neuralwatt:turn-energy';
 
 // ─── Data types ─────────────────────────────────────────────────────────────
 
+/** Selects which TPS measurement is shown as the primary TPS value. */
+export type TpsPrimaryMetric = 'decode' | 'generation' | 'wall';
+
+const DEFAULT_PRIMARY_METRIC: TpsPrimaryMetric = 'wall';
+
+interface TpsSettings {
+  primaryMetric?: unknown;
+}
+
+interface PiSettingsWithTps {
+  tps?: TpsSettings;
+}
+
 /** Structured telemetry persisted per turn in the session JSONL */
 interface TurnTelemetry {
   model: { provider: string; modelId: string };
@@ -90,8 +107,16 @@ interface TurnTelemetry {
     stallCount: number; // how many discrete stall events
     messageCount: number; // assistant messages in this turn
   };
-  tps: number | null; // output / (streamMs / 1000), null when burst/degenerate
-  isPrimaryBranch: boolean; // TPS came from primary-branch (reliable) measurement
+  /** Primary TPS value selected by the tps.primaryMetric setting. */
+  tps: number | null;
+  /** Inter-update decode TPS, excluding TTFT and known stalls. */
+  decodeTps: number | null;
+  /** Assistant-message generation TPS, excluding gaps between messages. */
+  generationTps: number | null;
+  /** Output-window TPS from first non-empty text delta to assistant message end. */
+  wallTps: number | null;
+  primaryMetric: TpsPrimaryMetric;
+  isPrimaryBranch: boolean; // Decode TPS came from the reliable primary branch
   cost: {
     input: number;
     output: number;
@@ -116,7 +141,9 @@ interface TurnTiming {
   turnIndex: number;
   turnStartMs: number;
   lastUpdateMs: number;
-  firstTokenMs: number | null;
+  firstTokenMs: number | null; // first non-empty content delta
+  firstTextMs: number | null; // first non-empty visible text delta
+  lastMessageEndMs: number | null;
   currentMessageStartMs: number | null;
   assistantMessages: AssistantMessage[];
   totalGenerationMs: number;
@@ -148,6 +175,32 @@ function computeRateUsdPerM(costUsd: number | null, totalTokens: number): number
   const rate = costUsd / (totalTokens / 1_000_000);
   if (!Number.isFinite(rate) || rate < 0) return null;
   return Math.round(rate * 100) / 100;
+}
+
+function roundTps(value: number): number | null {
+  if (!Number.isFinite(value) || value < 0) return null;
+  return Math.round(value * 10) / 10;
+}
+
+function resolvePrimaryMetric(pi: ExtensionAPI): TpsPrimaryMetric {
+  const settings =
+    typeof pi.getSettings === 'function'
+      ? (pi.getSettings() as PiSettingsWithTps | undefined)
+      : undefined;
+  const configured = settings?.tps?.primaryMetric;
+  if (configured === 'decode' || configured === 'generation' || configured === 'wall') {
+    return configured;
+  }
+  return DEFAULT_PRIMARY_METRIC;
+}
+
+function selectPrimaryTps(
+  metric: TpsPrimaryMetric,
+  values: Pick<TurnTelemetry, 'decodeTps' | 'generationTps' | 'wallTps'>
+): number | null {
+  if (metric === 'generation') return values.generationTps;
+  if (metric === 'wall') return values.wallTps;
+  return values.decodeTps;
 }
 
 /**
@@ -311,6 +364,7 @@ function composeDisplayString(t: TurnTelemetry): string {
 function buildTelemetry(
   timing: TurnTiming,
   turnEndMs: number,
+  primaryMetric: TpsPrimaryMetric,
   billedCost: number | null = null
 ): TurnTelemetry | null {
   let input = 0;
@@ -346,10 +400,18 @@ function buildTelemetry(
   }
 
   if (output <= 0) return null;
-  if (!timing.firstTokenMs) return null;
+  if (timing.firstTokenMs === null) return null;
+  if (timing.lastMessageEndMs === null) return null;
   if (!model) return null;
 
   const totalMs = turnEndMs - timing.turnStartMs;
+  const outputMs =
+    timing.firstTextMs === null ? null : timing.lastMessageEndMs - timing.firstTextMs;
+  const hasVisibleText = timing.assistantMessages.some((message) =>
+    message.content.some(
+      (part) => part.type === 'text' && typeof part.text === 'string' && part.text.length > 0
+    )
+  );
 
   // Inter-update TPS: measures the streaming span between the first and
   // last non-TTFT message_update events.
@@ -427,7 +489,7 @@ function buildTelemetry(
   //              → output / (effectiveGenMs / 1000)
   //              Includes TTFT, underestimates, but never overshoots.
   //   Else:      null — structurally unidentifiable.
-  let tps: number | null = null;
+  let decodeTps: number | null = null;
   let isPrimaryBranch = false;
   if (
     streamMs !== null &&
@@ -443,7 +505,7 @@ function buildTelemetry(
     // time the model was actually generating tokens.
     const effectiveStreamMs = streamMs - timing.stallMs;
     const raw = output / (effectiveStreamMs / 1000);
-    tps = Math.round(raw * 10) / 10;
+    decodeTps = roundTps(raw);
     isPrimaryBranch = true;
   } else if (timing.updateCount >= 2 && timing.totalGenerationMs >= MIN_GENERATION_MS) {
     // Fallback: use generationMs (message_start → message_end) minus
@@ -462,9 +524,9 @@ function buildTelemetry(
       effectiveGenMs = Math.max(effectiveGenMs, MIN_GENERATION_MS);
     }
     const raw = output / (effectiveGenMs / 1000);
-    tps = Math.round(raw * 10) / 10;
+    decodeTps = roundTps(raw);
   } else {
-    tps = null;
+    decodeTps = null;
   }
 
   // Volume-based sanity gate: extraordinary TPS claims require
@@ -479,10 +541,27 @@ function buildTelemetry(
   // But phrased as a measurement-reliability principle: the evidence
   // (effective window duration) must be proportional to the claim (token
   // volume ÷ inferred rate).
-  if (tps !== null && tps > MAX_PLAUSIBLE_TPS) {
-    tps = null;
+  if (decodeTps !== null && decodeTps > MAX_PLAUSIBLE_TPS) {
+    decodeTps = null;
     isPrimaryBranch = false;
   }
+
+  // Generation TPS includes the complete assistant message windows, including
+  // TTFT and any intra-message pauses, but excludes gaps between messages.
+  // Wall TPS measures from the first non-empty text delta to the assistant
+  // message end. It excludes TTFT and post-output tool handling.
+  const windowTps = (windowMs: number): number | null => {
+    if (windowMs <= 0) return null;
+    const value = roundTps(output / (windowMs / 1000));
+    return value !== null && value <= MAX_PLAUSIBLE_TPS ? value : null;
+  };
+  const generationTps = windowTps(timing.totalGenerationMs);
+  const wallTps = outputMs === null ? null : windowTps(outputMs);
+  const selectedTps = selectPrimaryTps(primaryMetric, { decodeTps, generationTps, wallTps });
+  // A turn that only produced thinking/tool-call output is not a useful
+  // user-facing TPS sample. Keep the diagnostic metrics, but do not display
+  // or expose one as the primary TPS value.
+  const tps = hasVisibleText ? selectedTps : null;
 
   // Single blended $/M-tokens rate for the banner. Cost source: Neuralwatt's
   // billed cost when present (energy-based, what the user actually pays),
@@ -508,6 +587,10 @@ function buildTelemetry(
       messageCount: timing.messageCount,
     },
     tps,
+    decodeTps,
+    generationTps,
+    wallTps,
+    primaryMetric,
     isPrimaryBranch,
     cost:
       listPriceCost !== null
@@ -647,6 +730,8 @@ export default function tpsExtension(pi: ExtensionAPI) {
       turnStartTimestamp: typeof _event.timestamp === 'number' ? _event.timestamp : Date.now(),
       lastUpdateMs: performance.now(),
       firstTokenMs: null,
+      firstTextMs: null,
+      lastMessageEndMs: null,
       currentMessageStartMs: null,
       assistantMessages: [],
       totalGenerationMs: 0,
@@ -663,8 +748,8 @@ export default function tpsExtension(pi: ExtensionAPI) {
   });
 
   // Track when a message starts. In pi, message_start fires at stream
-  // creation (before any tokens), so we defer TTFT to the first
-  // message_update which carries the first real token.
+  // creation (before any content), so TTFT is deferred to the first
+  // non-empty content delta.
   pi.on('message_start', (event: MessageStartEvent) => {
     if (!currentTiming) return;
     if (!isAssistantMessage(event.message)) return;
@@ -681,18 +766,39 @@ export default function tpsExtension(pi: ExtensionAPI) {
     currentTiming.inStall = false;
   });
 
-  // Track token-by-token updates during streaming (real-time TPS & stall detection).
-  // The first message_update is the effective first token (message_start fires
-  // at stream creation, before any content arrives).
+  // Track content updates during streaming (real-time TPS & stall detection).
+  // Pi emits message_update for *_start and *_end events as well as actual
+  // deltas. Only non-empty deltas represent emitted content. Keep the
+  // first text delta separately because wall TPS is meant to start at the
+  // first visible character, not at thinking/tool-call output or text_start.
   pi.on('message_update', (event: MessageUpdateEvent) => {
     if (!currentTiming) return;
     if (!isAssistantMessage(event.message)) return;
 
-    const now = performance.now();
+    const assistantEvent = event.assistantMessageEvent;
+    const isLegacyUpdate = assistantEvent?.type === undefined;
+    const isContentDelta =
+      isLegacyUpdate ||
+      ((assistantEvent?.type === 'text_delta' ||
+        assistantEvent?.type === 'thinking_delta' ||
+        assistantEvent?.type === 'toolcall_delta') &&
+        typeof assistantEvent.delta === 'string' &&
+        assistantEvent.delta.length > 0);
+    if (!isContentDelta) return;
 
-    // First token: capture TTFT and seed stall timing, then bail.
+    const now = performance.now();
+    const isTextDelta =
+      isLegacyUpdate ||
+      (assistantEvent?.type === 'text_delta' &&
+        typeof assistantEvent.delta === 'string' &&
+        assistantEvent.delta.length > 0);
+    if (isTextDelta && currentTiming.firstTextMs === null) {
+      currentTiming.firstTextMs = now;
+    }
+
+    // First content delta: capture TTFT and seed stall timing, then bail.
     // No stall detection on this event — the gap from message_start to
-    // first message_update is provider parsing overhead, not a stall.
+    // first content delta is provider parsing overhead, not a stall.
     if (currentTiming.firstTokenMs === null) {
       currentTiming.firstTokenMs = now;
       currentTiming.lastUpdateMs = now;
@@ -738,7 +844,7 @@ export default function tpsExtension(pi: ExtensionAPI) {
     const now = performance.now();
 
     // Accumulate ACTUAL streaming time for this message (true generation time)
-    if (currentTiming.currentMessageStartMs) {
+    if (currentTiming.currentMessageStartMs !== null) {
       const messageGenerationMs = now - currentTiming.currentMessageStartMs;
       currentTiming.totalGenerationMs += messageGenerationMs;
       currentTiming.currentMessageStartMs = null;
@@ -746,6 +852,7 @@ export default function tpsExtension(pi: ExtensionAPI) {
 
     // Store this message to count its tokens later (only current turn's messages)
     currentTiming.assistantMessages.push(event.message);
+    currentTiming.lastMessageEndMs = now;
     currentTiming.lastUpdateMs = now;
   });
 
@@ -779,7 +886,10 @@ export default function tpsExtension(pi: ExtensionAPI) {
       billedCost = findEnergyCostFromSession(ctx, timing.turnStartTimestamp);
     }
 
-    const telemetry = buildTelemetry(timing, turnEndMs, billedCost);
+    // Read settings per turn: Pi rejects action calls during extension loading,
+    // and this also picks up settings changes without a reload.
+    const primaryMetric = resolvePrimaryMetric(pi);
+    const telemetry = buildTelemetry(timing, turnEndMs, primaryMetric, billedCost);
     if (!telemetry) return;
 
     // ── Dynamic TPS cap ────────────────────────────────────────────────
@@ -788,20 +898,21 @@ export default function tpsExtension(pi: ExtensionAPI) {
     // short outputs over tiny time windows.
     const modelKey = `${telemetry.model.provider}:${telemetry.model.modelId}`;
 
-    if (telemetry.isPrimaryBranch && telemetry.tps !== null) {
+    // The cap is a safeguard for decode-TPS burst artifacts. Keep it tied to
+    // decodeTps even when another metric is selected for the banner.
+    if (telemetry.isPrimaryBranch && telemetry.decodeTps !== null) {
       const currentCap = tpsCaps.get(modelKey);
-      if (currentCap === undefined || telemetry.tps > currentCap) {
-        tpsCaps.set(modelKey, telemetry.tps);
+      if (currentCap === undefined || telemetry.decodeTps > currentCap) {
+        tpsCaps.set(modelKey, telemetry.decodeTps);
       }
     }
 
-    if (timing.isToolCall && telemetry.tps !== null) {
+    // Cap decodeTps itself so the persisted decode value and a decode-selected
+    // primary tps always agree.
+    if (timing.isToolCall && telemetry.decodeTps !== null) {
       const cap = tpsCaps.get(modelKey);
-      if (cap !== undefined) {
-        telemetry.tps = Math.min(telemetry.tps, cap);
-      } else {
-        telemetry.tps = null;
-      }
+      telemetry.decodeTps = cap !== undefined ? Math.min(telemetry.decodeTps, cap) : null;
+      telemetry.tps = selectPrimaryTps(primaryMetric, telemetry);
     }
 
     // Record this turn so a late-arriving neuralwatt:turn-energy event

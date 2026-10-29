@@ -7,6 +7,8 @@ describe('pi-tps extension — precision timing (performance.now())', () => {
 
   beforeEach(async () => {
     fixture = createTestFixture();
+    // This suite validates decode timing gates, not the default display metric.
+    fixture.settings.tps = { primaryMetric: 'decode' };
     await activateExtension(fixture);
   });
 

@@ -7,6 +7,8 @@ describe('pi-tps extension — volume-based TPS gate', () => {
 
   beforeEach(async () => {
     fixture = createTestFixture();
+    // This suite validates the decode volume gate, not the default wall metric.
+    fixture.settings.tps = { primaryMetric: 'decode' };
     await activateExtension(fixture);
   });
 

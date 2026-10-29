@@ -14,6 +14,7 @@ describe('pi-tps extension — telemetry flow', () => {
 
   beforeEach(async () => {
     fixture = createTestFixture();
+    fixture.settings.tps = { primaryMetric: 'decode' };
     await activateExtension(fixture);
   });
 

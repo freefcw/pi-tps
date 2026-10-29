@@ -7,6 +7,9 @@ describe('pi-tps extension — dynamic TPS cap', () => {
 
   beforeEach(async () => {
     fixture = createTestFixture();
+    // These tests exercise the decode-primary cap independently of the
+    // user-facing default wall metric.
+    fixture.settings.tps = { primaryMetric: 'decode' };
     await activateExtension(fixture);
   });
 

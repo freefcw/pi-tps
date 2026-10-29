@@ -82,6 +82,10 @@ export interface TestFixture {
   registerCommandSpy: ReturnType<typeof vi.fn>;
   mockEntries: Array<{ type?: string; role?: string; customType?: string; data?: unknown }>;
   mockCtx: ExtensionContext;
+  /** Effective Pi settings returned by getSettings() once the runtime is bound. */
+  settings: Record<string, unknown>;
+  /** Mirrors Pi binding extension actions after loading; called by activateExtension(). */
+  bindRuntime: () => void;
 }
 
 /**
@@ -139,7 +143,19 @@ export function createTestFixture(): TestFixture {
     }
   };
 
+  // Like Pi, action methods throw until the runtime is bound after loading.
+  let runtimeBound = false;
+  const settings: Record<string, unknown> = {};
+
   const mockPi: Partial<ExtensionAPI> = {
+    getSettings: vi.fn(() => {
+      if (!runtimeBound) {
+        throw new Error(
+          'Extension runtime not initialized. Action methods cannot be called during extension loading.'
+        );
+      }
+      return settings;
+    }) as any,
     on: vi.fn((event: string, handler: any) => {
       handlers[event] = handler;
       return () => {};
@@ -157,6 +173,10 @@ export function createTestFixture(): TestFixture {
   };
 
   return {
+    settings,
+    bindRuntime: () => {
+      runtimeBound = true;
+    },
     mockPi,
     handlers,
     commands,
@@ -174,4 +194,5 @@ export function createTestFixture(): TestFixture {
 export async function activateExtension(fixture: TestFixture) {
   const { default: tpsExtension } = await import('../index.js');
   tpsExtension(fixture.mockPi as ExtensionAPI);
+  fixture.bindRuntime();
 }
