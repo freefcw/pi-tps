@@ -36,7 +36,8 @@ pi install npm:@monotykamary/pi-tps
 
 ### Features
 
-- **Accurate TPS**: Uses `performance.now()` sub-millisecond timing; excludes TTFT, tool-execution gaps, and network latency from generation speed
+- **Configurable primary metric**: Choose decode speed, assistant-generation speed, or output-window TPS in Pi settings
+- **Accurate decode TPS**: Uses `performance.now()` sub-millisecond timing; excludes TTFT, tool-execution gaps, and network latency from generation speed
 - **Stall detection**: Detects inference pauses (GPU queuing, request queuing) and subtracts them from generation TPS — no inflated rates
 - **Burst discrimination**: Distinguishes genuine streaming from buffer-flush dispatch; shows `—` when the rate is structurally unidentifiable
 - **Multi-message turns**: Aggregates tokens and timing across tool-call chains within one turn
@@ -78,21 +79,45 @@ Then `/reload` in pi.
 TPS 42.5 tok/s · TTFT 1.2s · 29.7s · in 567 · out 1.2K · stall 4.3s×1 · $3.60/M
 ```
 
-| Field   | Description                                                                              |
-| ------- | ---------------------------------------------------------------------------------------- |
-| `TPS`   | Tokens per second (generation speed, excludes TTFT & stalls)                             |
-| `TTFT`  | Time to first token (seconds, 1 decimal)                                                 |
-| `s`     | Total wall-clock time from request to completion                                         |
-| `in`    | Input tokens (human-readable: K/M/B)                                                     |
-| `out`   | Output tokens (human-readable: K/M/B)                                                    |
-| `stall` | Accumulated stall time × stall count (shown only when stalls exist)                      |
-| `$/M`   | Blended $/million-tokens rate for this turn (shown only when a cost source is available) |
+| Field   | Description                                                                                                         |
+| ------- | ------------------------------------------------------------------------------------------------------------------- |
+| `TPS`   | The configured primary metric; defaults to output-window TPS from first visible text delta to assistant message end |
+| `TTFT`  | Time to first token (seconds, 1 decimal)                                                                            |
+| `s`     | Total wall-clock time from request to completion                                                                    |
+| `in`    | Input tokens (human-readable: K/M/B)                                                                                |
+| `out`   | Output tokens (human-readable: K/M/B)                                                                               |
+| `stall` | Accumulated stall time × stall count (shown only when stalls exist)                                                 |
+| `$/M`   | Blended $/million-tokens rate for this turn (shown only when a cost source is available)                            |
 
 When TPS can't be determined (burst delivery, too few chunks), the field shows `—`:
 
 ```
 TPS — · TTFT 0.8s · 1.3s · in 291 · out 46 · $2.59/M
 ```
+
+### Primary TPS metric configuration
+
+Set `tps.primaryMetric` in `~/.pi/agent/settings.json` or the project `.pi/settings.json`:
+
+```json
+{
+  "tps": {
+    "primaryMetric": "wall"
+  }
+}
+```
+
+Available values:
+
+| Value        | Meaning                                                                                                                                                                                                                                                                           |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `decode`     | Uses reliable inter-update decode speed when available; otherwise falls back to a conservative generation-window calculation that may include TTFT. Known stalls are handled by the existing stall guards and reduction rules.                                                    |
+| `generation` | Output tokens divided by complete assistant-generation time; includes TTFT and pauses inside assistant messages, but excludes gaps between assistant messages.                                                                                                                    |
+| `wall`       | Output tokens divided by the interval from the first non-empty text delta (first visible character) to the assistant `message_end`. It excludes TTFT and post-output tool handling. Turns with no visible text do not expose this as the primary TPS. This is the default metric. |
+
+The persisted `tps` field and notification use the selected metric. Each telemetry entry also keeps all three values in `decodeTps`, `generationTps`, and `wallTps`, so changing the setting does not discard the other measurements. The setting is read at the end of each turn, so changes apply from the next turn. Invalid or missing values fall back to `wall`. All three metrics are subject to the same maximum-plausible-TPS sanity gate; values above the gate are reported as `null` and displayed as `—`.
+
+Each Pi turn corresponds to one model request. If the assistant calls tools, Pi ends the turn after tool execution and starts the next model request with a new `turn_start`. Therefore `wallTps` measures one request from its first visible text delta to its assistant `message_end`; it intentionally excludes tool execution after that message. If a full user request spanning several model/tool turns is needed, that should be calculated separately over the `agent_start` → `agent_settled` lifecycle.
 
 ### $/M-tokens rate
 
@@ -120,32 +145,34 @@ Duration formatting:
 
 ## How it works
 
-The extension hooks into pi's lifecycle events. The critical detail: `message_start` fires at stream creation (before any tokens), so **TTFT is measured at the first `message_update`**, which carries the first real token content.
+The extension hooks into pi's lifecycle events. The critical detail: `message_start` fires at stream creation, and Pi also emits `message_update` for content-block start/end events. **TTFT and the wall-TPS window start at the first non-empty content delta**; for user-facing wall TPS this is the first non-empty `text_delta`.
 
 ### Event sequence
 
 ```
 turn_start         →  request sent to LLM, timer starts
 message_start      →  stream created, stall-tracking reset for this message
-message_update (1) →  first token arrives → TTFT captured
-message_update (N) →  streaming tokens arrive → inter-update span & stall detection
+message_update       →  content-block start/end events (not timing anchors)
+message_update       →  first non-empty delta arrives → TTFT captured
+message_update (N)   →  streaming deltas arrive → inter-update span & stall detection
 message_end        →  message complete, generation time accumulated
 turn_end           →  telemetry computed and displayed
 ```
 
 ### Timing breakdown
 
-| Phase           | Measured by                                                                                  |
-| --------------- | -------------------------------------------------------------------------------------------- |
-| **TTFT**        | `turn_start` → first `message_update`                                                        |
-| **Generation**  | per-message wall clock (`message_start` → `message_end`), summed across messages in the turn |
-| **Stream span** | first `message_update` (post-TTFT) → last `message_update` — the pure streaming window       |
-| **Total**       | `turn_start` → last `message_end` in the turn                                                |
+| Phase             | Measured by                                                                                  |
+| ----------------- | -------------------------------------------------------------------------------------------- |
+| **TTFT**          | `turn_start` → first non-empty content delta                                                 |
+| **Generation**    | per-message wall clock (`message_start` → `message_end`), summed across messages in the turn |
+| **Stream span**   | first content delta (post-TTFT) → last `message_update` — the pure streaming window          |
+| **Total**         | `turn_start` → `turn_end`                                                                    |
+| **Output window** | first non-empty `text_delta` → assistant `message_end`                                       |
 
 This approach excludes:
 
 - **Network latency** (included in TTFT)
-- **Tool-execution gaps** between messages (stall clock resets on each `message_start`)
+- **Post-output tool execution** (the request ends at assistant `message_end`)
 - **Server queue time** (included in TTFT)
 
 ### Stall detection
@@ -163,11 +190,13 @@ When a stall occurs **before** the first stream update (common in request-queuin
 
 The extension uses a defense-in-depth strategy to produce reliable TPS:
 
-1. **Primary** — Requires ≥5 streaming updates with ≥1ms average inter-chunk gap and stall time < active generation time. Subtracts stalls from the streaming window for pure generation speed.
+1. **Decode primary branch** — Requires ≥5 streaming updates with ≥1ms average inter-chunk gap and stall time < active generation time. Subtracts stalls from the streaming window for pure decode speed.
 
-2. **Fallback** — When primary conditions fail but ≥2 updates exist and total generation time ≥50ms. Uses the full generation window (includes TTFT, so it underestimates — safe by design). Applies partial stall reduction when stalls dominate.
+2. **Decode fallback branch** — When the decode primary conditions fail but ≥2 updates exist and total generation time ≥200ms. Uses the full generation window, which includes TTFT and therefore produces a conservative rate. Applies partial stall reduction when stalls dominate.
 
-3. **Null** — Returns `null` (displayed as `—`) when the timing is structurally unidentifiable: burst delivery (all tokens arrive in the same tick), too few chunks, or generation time too short for a reliable rate.
+3. **Output-window metrics** — `generationTps` uses the complete assistant-message window, while `wallTps` uses the interval from the first non-empty `text_delta` to `message_end`, excluding TTFT and post-output tool handling. Turns without visible text do not expose `wallTps` as the primary displayed TPS. Both are calculated independently of whether the decode primary or fallback branch was used.
+
+4. **Sanity gate** — All three metrics are set to `null` (displayed as `—`) when their calculated rate exceeds the maximum plausible TPS threshold. Decode also returns `null` when timing is structurally unidentifiable: burst delivery, too few chunks, or a generation window too short for a reliable rate.
 
 ---
 
@@ -209,30 +238,34 @@ pi.events.on('tps:telemetry', (data) => {
 
 The event payload:
 
-| Field                 | Type             | Description                                                                                                                                                           |
-| --------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tps`                 | `number \| null` | Tokens per second, or null when unidentifiable                                                                                                                        |
-| `model.provider`      | `string`         | Provider name (e.g. `openai`)                                                                                                                                         |
-| `model.modelId`       | `string`         | Model identifier (e.g. `gpt-4`)                                                                                                                                       |
-| `tokens.input`        | `number`         | Input tokens (summed across all assistant messages)                                                                                                                   |
-| `tokens.output`       | `number`         | Output tokens generated by the LLM                                                                                                                                    |
-| `tokens.cacheRead`    | `number`         | Cache-read tokens (provider-dependent)                                                                                                                                |
-| `tokens.cacheWrite`   | `number`         | Cache-write tokens (provider-dependent)                                                                                                                               |
-| `tokens.total`        | `number`         | Total tokens (input + output + cache)                                                                                                                                 |
-| `timing.ttftMs`       | `number \| null` | Time to first token in milliseconds                                                                                                                                   |
-| `timing.totalMs`      | `number`         | Total wall-clock time from request to completion                                                                                                                      |
-| `timing.generationMs` | `number`         | Streaming wall clock (message_start → message_end)                                                                                                                    |
-| `timing.streamMs`     | `number \| null` | Inter-update span: first → last streaming update                                                                                                                      |
-| `timing.stallMs`      | `number`         | Accumulated inference stall time in ms                                                                                                                                |
-| `timing.stallCount`   | `number`         | Number of discrete stall events                                                                                                                                       |
-| `timing.messageCount` | `number`         | Assistant messages in this turn                                                                                                                                       |
-| `cost.input`          | `number \| null` | Input token cost                                                                                                                                                      |
-| `cost.output`         | `number \| null` | Output token cost                                                                                                                                                     |
-| `cost.cacheRead`      | `number \| null` | Cache-read token cost                                                                                                                                                 |
-| `cost.cacheWrite`     | `number \| null` | Cache-write token cost                                                                                                                                                |
-| `cost.total`          | `number \| null` | Total cost for this turn                                                                                                                                              |
-| `timestamp`           | `number`         | Unix timestamp (ms) when telemetry was computed                                                                                                                       |
-| `rateUsdPerMTokens`   | `number \| null` | Blended $/M-tokens rate for this turn (Neuralwatt billed cost when available, else list-price compute cost). `null` when no cost source is usable or tokens are zero. |
+| Field                 | Type                                 | Description                                                                                                                                                           |
+| --------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tps`                 | `number \| null`                     | Tokens per second, or null when unidentifiable                                                                                                                        |
+| `model.provider`      | `string`                             | Provider name (e.g. `openai`)                                                                                                                                         |
+| `model.modelId`       | `string`                             | Model identifier (e.g. `gpt-4`)                                                                                                                                       |
+| `tokens.input`        | `number`                             | Input tokens (summed across all assistant messages)                                                                                                                   |
+| `tokens.output`       | `number`                             | Output tokens generated by the LLM                                                                                                                                    |
+| `tokens.cacheRead`    | `number`                             | Cache-read tokens (provider-dependent)                                                                                                                                |
+| `tokens.cacheWrite`   | `number`                             | Cache-write tokens (provider-dependent)                                                                                                                               |
+| `tokens.total`        | `number`                             | Total tokens (input + output + cache)                                                                                                                                 |
+| `timing.ttftMs`       | `number \| null`                     | Time to first token in milliseconds                                                                                                                                   |
+| `timing.totalMs`      | `number`                             | Total wall-clock time from request to completion                                                                                                                      |
+| `timing.generationMs` | `number`                             | Streaming wall clock (message_start → message_end)                                                                                                                    |
+| `timing.streamMs`     | `number \| null`                     | Inter-update span: first → last streaming update                                                                                                                      |
+| `timing.stallMs`      | `number`                             | Accumulated inference stall time in ms                                                                                                                                |
+| `timing.stallCount`   | `number`                             | Number of discrete stall events                                                                                                                                       |
+| `timing.messageCount` | `number`                             | Assistant messages in this turn                                                                                                                                       |
+| `decodeTps`           | `number \| null`                     | Inter-update decode TPS, excluding TTFT and known stalls                                                                                                              |
+| `generationTps`       | `number \| null`                     | Assistant-generation wall-clock TPS, excluding gaps between assistant messages                                                                                        |
+| `wallTps`             | `number \| null`                     | Output-window TPS from first non-empty `text_delta` to assistant `message_end`; excludes post-output tool handling and is null as primary TPS without visible text    |
+| `primaryMetric`       | `"decode" \| "generation" \| "wall"` | Metric selected for the primary `tps` value                                                                                                                           |
+| `cost.input`          | `number \| null`                     | Input token cost                                                                                                                                                      |
+| `cost.output`         | `number \| null`                     | Output token cost                                                                                                                                                     |
+| `cost.cacheRead`      | `number \| null`                     | Cache-read token cost                                                                                                                                                 |
+| `cost.cacheWrite`     | `number \| null`                     | Cache-write token cost                                                                                                                                                |
+| `cost.total`          | `number \| null`                     | Total cost for this turn                                                                                                                                              |
+| `timestamp`           | `number`                             | Unix timestamp (ms) when telemetry was computed                                                                                                                       |
+| `rateUsdPerMTokens`   | `number \| null`                     | Blended $/M-tokens rate for this turn (Neuralwatt billed cost when available, else list-price compute cost). `null` when no cost source is usable or tokens are zero. |
 
 When `cost` is unavailable (provider doesn't report it), the entire `cost` object is `null`.
 
